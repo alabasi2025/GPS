@@ -2,6 +2,10 @@
 
 تطبيق أندرويد بسيط وسريع **يحدد موقعك بدقة عالية عبر GPS**، يعرض العنوان على خريطة، ويشاركه عبر واتساب أو أي تطبيق برابط خرائط جوجل.
 
+> 🤖 **للوكيل/المطوّر القادم:** ابدأ بقراءة [`AGENTS.md`](AGENTS.md) ثم [`docs/`](docs/) — فيها كل شيء:
+> [البنية](docs/ARCHITECTURE.md) • [الخوارزميات](docs/ALGORITHMS.md) • [البناء والنشر](docs/BUILD_RELEASE.md) •
+> [الاختبارات](docs/TESTING.md) • [السجل](docs/HISTORY.md) • [القيود والخطة](docs/ROADMAP.md) • [التوقيع](signing/README.md)
+
 ## ⬇️ تحميل التطبيق
 
 **[تحميل مباشر — mawqi-now.apk (7.4 MB)](https://github.com/alabasi2025/GPS/releases/latest/download/mawqi-now.apk)**
