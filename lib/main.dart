@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -7,9 +9,15 @@ import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
-import 'package:latlong2/latlong.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:latlong2/latlong.dart' hide Path;
+import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
+
+import 'engine/fusion.dart';
+import 'services/points.dart';
+import 'services/updater.dart';
 
 void main() => runApp(const MawqiApp());
 
@@ -44,65 +52,86 @@ class LocationScreen extends StatefulWidget {
 }
 
 class _LocationScreenState extends State<LocationScreen> {
-  final MapController _map = MapController();
-  StreamSubscription<Position>? _sub;
-  StreamSubscription<dynamic>? _gpsSub;
-  static const _gpsEvents = EventChannel('mawqi/gps');
-  Position? _pos;
-  Position? _raw; // latest raw fix from the GPS chip
-  final List<Position> _samples = []; // stationary samples for averaging
-  int _satUsed = 0;
-  int _satVisible = 0;
-  double _avgCn0 = 0;
-  Map<String, List<int>> _constellations = {};
-  bool get _nativeGps =>
+  static const _stream = EventChannel('mawqi/stream');
+  bool get _android =>
       !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+
+  final MapController _map = MapController();
+  final FusionEngine _eng = FusionEngine();
+  StreamSubscription<dynamic>? _sub;
+  StreamSubscription<Position>? _webSub;
+  Timer? _tick;
+
+  String? _error;
   String? _address;
   bool _loadingAddress = false;
-  String? _error;
-  bool _searching = false;
   LatLng? _lastGeocoded;
   bool _mapReady = false;
+  bool _follow = true;
+
+  // live sensor info
+  int _satUsed = 0, _satVisible = 0;
+  double _cn0 = 0;
+  Map<String, List<int>> _consts = {};
+  double? _heading;
+  double _headingErr = 0;
+  String _headingSrc = '';
+  final List<LatLng> _trail = [];
+
+  List<SavedPoint> _points = [];
+
+  // updater
+  UpdateInfo? _update;
+  double? _updProgress;
+  String _version = '';
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _start());
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await _loadState();
+      _start();
+      _checkUpdate(silent: true);
+    });
+    _tick = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted && _eng.phase == Phase.acquiring) setState(() {});
+    });
   }
 
   @override
   void dispose() {
     _sub?.cancel();
-    _gpsSub?.cancel();
+    _webSub?.cancel();
+    _tick?.cancel();
     super.dispose();
   }
 
-  LocationSettings get _settings {
-    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
-      return AndroidSettings(
-        accuracy: LocationAccuracy.bestForNavigation,
-        distanceFilter: 0,
-        intervalDuration: const Duration(seconds: 1),
-        forceLocationManager: false,
-      );
-    }
-    return const LocationSettings(
-      accuracy: LocationAccuracy.best,
-      distanceFilter: 0,
-    );
+  Future<void> _loadState() async {
+    final (k, b, c, m) = await Store.loadCalibration();
+    _eng.stepK = k;
+    _eng.headingBiasDeg = b;
+    _eng.calibrations = c;
+    _eng.mode = m == 'sensors' ? FusionMode.sensors : FusionMode.hybrid;
+    _points = await Store.loadPoints();
+    _version = await Updater.currentVersion();
+    if (mounted) setState(() {});
   }
 
+  void _saveCal() => Store.saveCalibration(
+    _eng.stepK,
+    _eng.headingBiasDeg,
+    _eng.calibrations,
+    _eng.mode == FusionMode.sensors ? 'sensors' : 'hybrid',
+  );
+
+  // ---------------------------------------------------------------- start
   Future<void> _start() async {
-    setState(() {
-      _error = null;
-      _searching = true;
-    });
+    setState(() => _error = null);
     try {
       if (!await Geolocator.isLocationServiceEnabled()) {
-        setState(() {
-          _error = 'خدمة الموقع (GPS) مقفلة. فعّلها ثم اضغط "إعادة المحاولة".';
-          _searching = false;
-        });
+        setState(
+          () => _error = 'خدمة الموقع مقفلة. فعّلها ثم اضغط "إعادة المحاولة".',
+        );
         if (!kIsWeb) await Geolocator.openLocationSettings();
         return;
       }
@@ -111,176 +140,159 @@ class _LocationScreenState extends State<LocationScreen> {
         perm = await Geolocator.requestPermission();
       }
       if (perm == LocationPermission.denied) {
-        setState(() {
-          _error = 'لازم تسمح للتطبيق بالوصول إلى الموقع.';
-          _searching = false;
-        });
+        setState(() => _error = 'لازم تسمح للتطبيق بالوصول إلى الموقع.');
         return;
       }
       if (perm == LocationPermission.deniedForever) {
-        setState(() {
-          _error = 'صلاحية الموقع مرفوضة نهائياً. افتح الإعدادات واسمح بها.';
-          _searching = false;
-        });
+        setState(
+          () => _error =
+              'صلاحية الموقع مرفوضة نهائياً. افتح الإعدادات واسمح بها.',
+        );
         if (!kIsWeb) await Geolocator.openAppSettings();
         return;
       }
-
-      await _sub?.cancel();
-      await _gpsSub?.cancel();
-      if (_nativeGps) {
-        _listenNativeGps();
-        return;
-      }
-      _sub = Geolocator.getPositionStream(locationSettings: _settings).listen(
-        _onPosition,
-        onError: (e) {
-          if (!mounted) return;
-          setState(() {
-            _error = 'تعذر تحديد الموقع: $e';
-            _searching = false;
-          });
-        },
-      );
-    } catch (e) {
-      setState(() {
-        _error = 'حدث خطأ: $e';
-        _searching = false;
-      });
-    }
-  }
-
-  /// Android: raw GPS chip (LocationManager.GPS_PROVIDER) + GNSS satellites.
-  void _listenNativeGps() {
-    _gpsSub = _gpsEvents.receiveBroadcastStream().listen(
-      (e) {
-        final m = Map<String, dynamic>.from(e as Map);
-        switch (m['type']) {
-          case 'gnss':
-            if (!mounted) return;
-            setState(() {
-              _satVisible = (m['visible'] as num?)?.toInt() ?? 0;
-              _satUsed = (m['used'] as num?)?.toInt() ?? 0;
-              _avgCn0 = (m['avgCn0'] as num?)?.toDouble() ?? 0;
-              _constellations = (m['constellations'] as Map? ?? {}).map(
-                (k, v) => MapEntry(
-                  k as String,
-                  (v as List).map((x) => (x as num).toInt()).toList(),
-                ),
-              );
-            });
-          case 'location':
-            final acc = (m['acc'] as num?)?.toDouble() ?? 9999;
-            final p = Position(
-              latitude: (m['lat'] as num).toDouble(),
-              longitude: (m['lng'] as num).toDouble(),
-              timestamp: DateTime.fromMillisecondsSinceEpoch(
-                (m['time'] as num).toInt(),
-              ),
-              accuracy: acc,
-              altitude: (m['alt'] as num?)?.toDouble() ?? 0,
-              altitudeAccuracy: (m['vAcc'] as num?)?.toDouble() ?? 0,
-              heading: (m['bearing'] as num?)?.toDouble() ?? 0,
-              headingAccuracy: 0,
-              speed: (m['speed'] as num?)?.toDouble() ?? 0,
-              speedAccuracy: 0,
-              isMocked: m['mock'] == true,
-            );
-            _onPosition(p, fromCache: m['cached'] == true);
-          case 'disabled':
-            if (!mounted) return;
-            setState(() {
-              _error = 'تم إيقاف GPS. فعّله ثم اضغط "إعادة المحاولة".';
-              _searching = false;
-            });
+      if (_android) {
+        final acc = await Geolocator.getLocationAccuracy();
+        if (acc == LocationAccuracyStatus.reduced && mounted) {
+          setState(
+            () => _error =
+                'التطبيق مسموح له بالموقع "التقريبي" فقط. افتح الإعدادات واختر "الموقع الدقيق".',
+          );
+          await Geolocator.openAppSettings();
+          return;
         }
-      },
-      onError: (e) {
-        if (!mounted) return;
-        final code = e is PlatformException ? e.code : '';
-        setState(() {
-          _error = code == 'GPS_DISABLED'
-              ? 'GPS مقفل. افتح الإعدادات وفعّل "الموقع" ثم اضغط "إعادة المحاولة".'
-              : 'تعذر تشغيل GPS: $e';
-          _searching = false;
-        });
-        if (code == 'GPS_DISABLED') Geolocator.openLocationSettings();
-      },
-    );
-  }
-
-  /// Inverse-variance weighted mean of stationary fixes -> more precise point.
-  Position _averaged() {
-    double w = 0, lat = 0, lng = 0;
-    for (final s in _samples) {
-      final wi = 1 / (s.accuracy * s.accuracy);
-      w += wi;
-      lat += s.latitude * wi;
-      lng += s.longitude * wi;
-    }
-    final last = _samples.last;
-    final best = _samples
-        .map((s) => s.accuracy)
-        .reduce((a, b) => a < b ? a : b);
-    return Position(
-      latitude: lat / w,
-      longitude: lng / w,
-      timestamp: last.timestamp,
-      accuracy: best,
-      altitude: last.altitude,
-      altitudeAccuracy: last.altitudeAccuracy,
-      heading: last.heading,
-      headingAccuracy: 0,
-      speed: last.speed,
-      speedAccuracy: 0,
-      isMocked: last.isMocked,
-    );
-  }
-
-  void _onPosition(Position p, {bool fromCache = false}) {
-    if (!mounted) return;
-    final first = _pos == null;
-    _raw = p;
-    if (fromCache) {
-      setState(() {
-        _pos = p;
-        _searching = true;
-      });
-    } else {
-      // Reset averaging when the user is moving or jumped away.
-      if (_samples.isNotEmpty) {
-        final mean = _averaged();
-        final d = Geolocator.distanceBetween(
-          mean.latitude,
-          mean.longitude,
-          p.latitude,
-          p.longitude,
+      }
+      await _sub?.cancel();
+      await _webSub?.cancel();
+      _eng.start(DateTime.now());
+      if (_android) {
+        _sub = _stream.receiveBroadcastStream().listen(
+          _onEvent,
+          onError: _onStreamError,
         );
-        final moving = p.speed > 1.0;
-        if (moving || d > (p.accuracy * 1.5).clamp(8, 60)) _samples.clear();
+      } else {
+        _webSub =
+            Geolocator.getPositionStream(
+              locationSettings: const LocationSettings(
+                accuracy: LocationAccuracy.best,
+                distanceFilter: 0,
+              ),
+            ).listen(
+              (p) => _onFix(
+                Fix(
+                  lat: p.latitude,
+                  lng: p.longitude,
+                  acc: p.accuracy,
+                  source: 'web',
+                  time: DateTime.now(),
+                ),
+              ),
+              onError: _onStreamError,
+            );
       }
-      if (p.accuracy <= 50) {
-        _samples.add(p);
-        if (_samples.length > 60) _samples.removeAt(0);
-      }
-      final shown = _samples.isNotEmpty ? _averaged() : p;
-      setState(() {
-        _pos = shown;
-        _searching = p.accuracy > 10;
-      });
+    } catch (e) {
+      setState(() => _error = 'حدث خطأ: $e');
     }
-    final p2 = _pos!;
-    p = p2;
-    final ll = LatLng(p.latitude, p.longitude);
-    if (_mapReady) {
-      _map.move(ll, first ? 17 : _map.camera.zoom);
-    }
-    final needGeo =
-        _lastGeocoded == null ||
-        const Distance().as(LengthUnit.Meter, _lastGeocoded!, ll) > 40;
-    if (needGeo) _reverseGeocode(ll);
   }
 
+  void _onStreamError(Object e) {
+    if (!mounted) return;
+    final code = e is PlatformException ? e.code : '';
+    setState(() {
+      _error = code == 'GPS_DISABLED'
+          ? 'الموقع مقفل. فعّله من الإعدادات ثم اضغط "إعادة المحاولة".'
+          : 'تعذر تحديد الموقع: $e';
+    });
+    if (code == 'GPS_DISABLED') Geolocator.openLocationSettings();
+  }
+
+  void _onEvent(dynamic e) {
+    final m = Map<String, dynamic>.from(e as Map);
+    switch (m['type']) {
+      case 'fix':
+        if (m['cached'] == true) return; // never seed with stale cache
+        _onFix(
+          Fix(
+            lat: (m['lat'] as num).toDouble(),
+            lng: (m['lng'] as num).toDouble(),
+            acc: (m['acc'] as num?)?.toDouble() ?? 50,
+            source: m['source'] as String? ?? 'gps',
+            time: DateTime.now(),
+            mock: m['mock'] == true,
+            speed: (m['speed'] as num?)?.toDouble(),
+          ),
+        );
+      case 'gnss':
+        setState(() {
+          _satVisible = (m['visible'] as num?)?.toInt() ?? 0;
+          _satUsed = (m['used'] as num?)?.toInt() ?? 0;
+          _cn0 = (m['avgCn0'] as num?)?.toDouble() ?? 0;
+          _consts = (m['constellations'] as Map? ?? {}).map(
+            (k, v) => MapEntry(
+              k as String,
+              (v as List).map((x) => (x as num).toInt()).toList(),
+            ),
+          );
+        });
+      case 'heading':
+        setState(() {
+          _heading = (m['deg'] as num).toDouble();
+          _headingErr = (m['err'] as num?)?.toDouble() ?? 0;
+          _headingSrc = m['src'] as String? ?? '';
+        });
+      case 'step':
+        final wasCal = _eng.calibrations;
+        _eng.addStep(
+          StepEvent(
+            (m['w'] as num).toDouble(),
+            (m['heading'] as num).toDouble(),
+            (m['headingErr'] as num?)?.toDouble() ?? 15,
+          ),
+        );
+        if (_eng.calibrations != wasCal) _saveCal();
+        _afterUpdate();
+      case 'disabled':
+        setState(
+          () => _error = 'تم إيقاف GPS. فعّله ثم اضغط "إعادة المحاولة".',
+        );
+    }
+  }
+
+  void _onFix(Fix f) {
+    final wasCal = _eng.calibrations;
+    final wasPhase = _eng.phase;
+    _eng.addFix(f);
+    if (_eng.calibrations != wasCal) _saveCal();
+    if (wasPhase == Phase.acquiring && _eng.phase == Phase.tracking) {
+      HapticFeedback.mediumImpact();
+      _trail.clear();
+    }
+    _afterUpdate();
+  }
+
+  void _afterUpdate() {
+    if (!mounted || !_eng.hasPosition) return;
+    final p = _eng.position;
+    final ll = LatLng(p.lat, p.lng);
+    if (_eng.phase == Phase.tracking) {
+      if (_trail.isEmpty ||
+          const Distance().as(LengthUnit.Meter, _trail.last, ll) > 0.5) {
+        _trail.add(ll);
+        if (_trail.length > 2000) _trail.removeAt(0);
+      }
+    }
+    setState(() {});
+    if (_mapReady && _follow) {
+      final z = _map.camera.zoom;
+      _map.move(ll, z < 15 ? 18 : z);
+    }
+    if (_lastGeocoded == null ||
+        const Distance().as(LengthUnit.Meter, _lastGeocoded!, ll) > 40) {
+      _reverseGeocode(ll);
+    }
+  }
+
+  // ---------------------------------------------------------------- address
   Future<void> _reverseGeocode(LatLng ll) async {
     _lastGeocoded = ll;
     setState(() => _loadingAddress = true);
@@ -298,16 +310,14 @@ class _LocationScreenState extends State<LocationScreen> {
             uri,
             headers: {
               if (!kIsWeb)
-                'User-Agent': 'MawqiNow/1.0 (com.mawqianow.location)',
+                'User-Agent': 'MawqiNow/1.2 (com.mawqianow.location)',
             },
           )
           .timeout(const Duration(seconds: 12));
       if (res.statusCode == 200) {
-        final data = jsonDecode(utf8.decode(res.bodyBytes));
-        setState(() => _address = _formatAddress(data));
+        _address = _formatAddress(jsonDecode(utf8.decode(res.bodyBytes)));
       }
     } catch (_) {
-      // Address is optional; coordinates remain available.
     } finally {
       if (mounted) setState(() => _loadingAddress = false);
     }
@@ -333,76 +343,490 @@ class _LocationScreenState extends State<LocationScreen> {
     );
     add(a['state'] as String?);
     add(a['country'] as String?);
-    if (parts.isEmpty) return data['display_name'] as String?;
-    return parts.join('، ');
+    return parts.isEmpty ? data['display_name'] as String? : parts.join('، ');
   }
 
-  String get _coords =>
-      '${_pos!.latitude.toStringAsFixed(6)}, ${_pos!.longitude.toStringAsFixed(6)}';
+  // ---------------------------------------------------------------- helpers
+  String get _method {
+    if (_eng.phase != Phase.tracking) return 'gnss';
+    return _eng.mode == FusionMode.sensors ? 'sensors' : 'hybrid';
+  }
 
-  String get _mapsLink =>
-      'https://maps.google.com/?q=${_pos!.latitude.toStringAsFixed(6)},${_pos!.longitude.toStringAsFixed(6)}';
+  String _methodLabel(String m) => switch (m) {
+    'sensors' => 'حساسات الهاتف (PDR)',
+    'hybrid' => 'دمج GPS + حساسات',
+    _ => 'GPS + Google Fused',
+  };
 
-  String get _shareText {
-    final b = StringBuffer('📍 موقعي الحالي\n');
-    if (_address != null) b.writeln(_address);
-    b.writeln('الإحداثيات: $_coords');
-    b.writeln('الدقة: ±${_pos!.accuracy.round()} متر');
-    b.write(_mapsLink);
+  String _coordsOf(double lat, double lng) =>
+      '${lat.toStringAsFixed(7)}, ${lng.toStringAsFixed(7)}';
+
+  String _linkOf(double lat, double lng) =>
+      'https://maps.google.com/?q=${lat.toStringAsFixed(7)},${lng.toStringAsFixed(7)}';
+
+  String _shareTextOf({
+    required double lat,
+    required double lng,
+    required double acc,
+    String? address,
+    String title = '📍 موقعي الحالي',
+  }) {
+    final b = StringBuffer('$title\n');
+    if (address != null) b.writeln(address);
+    b.writeln('الإحداثيات: ${_coordsOf(lat, lng)}');
+    b.writeln('الدقة: ±${acc.toStringAsFixed(1)} متر');
+    b.write(_linkOf(lat, lng));
     return b.toString();
   }
 
-  Future<void> _share() async {
-    if (_pos == null) return;
-    await SharePlus.instance.share(ShareParams(text: _shareText));
-  }
-
-  Future<void> _whatsapp() async {
-    if (_pos == null) return;
-    final uri = Uri.parse(
-      'https://wa.me/?text=${Uri.encodeComponent(_shareText)}',
+  String get _shareText {
+    final p = _eng.position;
+    return _shareTextOf(
+      lat: p.lat,
+      lng: p.lng,
+      acc: _eng.accuracy,
+      address: _address,
     );
-    if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
-      await _share();
-    }
   }
 
-  Future<void> _openMaps() async {
-    if (_pos == null) return;
-    await launchUrl(Uri.parse(_mapsLink), mode: LaunchMode.externalApplication);
+  Future<void> _whatsappText(String text) async {
+    final uri = Uri.parse('https://wa.me/?text=${Uri.encodeComponent(text)}');
+    if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
+      await SharePlus.instance.share(ShareParams(text: text));
+    }
   }
 
   void _copy(String text, String label) {
     Clipboard.setData(ClipboardData(text: text));
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('تم نسخ $label'),
-        behavior: SnackBarBehavior.floating,
-        duration: const Duration(seconds: 2),
+    _snack('تم نسخ $label');
+  }
+
+  void _snack(String s) => ScaffoldMessenger.of(context).showSnackBar(
+    SnackBar(
+      content: Text(s),
+      behavior: SnackBarBehavior.floating,
+      duration: const Duration(seconds: 2),
+    ),
+  );
+
+  Color _accColor(double acc) {
+    if (acc <= 5) return const Color(0xFF16A34A);
+    if (acc <= 15) return const Color(0xFF65A30D);
+    if (acc <= 50) return const Color(0xFFF59E0B);
+    return const Color(0xFFDC2626);
+  }
+
+  // ---------------------------------------------------------------- capture
+  Future<void> _capture({required bool withPhoto}) async {
+    if (!_eng.hasPosition) return;
+    // freeze the position at the moment of the press
+    final p = _eng.position;
+    final acc = _eng.accuracy;
+    final method = _method;
+    final steps = _eng.steps;
+    final walked = _eng.walked;
+    String? photo;
+    if (withPhoto) {
+      try {
+        final x = await ImagePicker().pickImage(
+          source: ImageSource.camera,
+          imageQuality: 80,
+          maxWidth: 1920,
+        );
+        if (x == null) return;
+        if (!kIsWeb) {
+          final dir = await getApplicationDocumentsDirectory();
+          final pd = Directory('${dir.path}/photos');
+          if (!pd.existsSync()) pd.createSync(recursive: true);
+          final dest =
+              '${pd.path}/${DateTime.now().millisecondsSinceEpoch}.jpg';
+          await File(x.path).copy(dest);
+          photo = dest;
+        }
+      } catch (e) {
+        _snack('تعذر فتح الكاميرا: $e');
+        return;
+      }
+    }
+    final pt = SavedPoint(
+      id: DateTime.now().microsecondsSinceEpoch.toString(),
+      lat: p.lat,
+      lng: p.lng,
+      acc: acc,
+      method: method,
+      time: DateTime.now(),
+      photoPath: photo,
+      address: _address,
+      steps: steps,
+      walked: walked,
+      name: 'نقطة ${_points.length + 1}',
+    );
+    setState(() => _points.insert(0, pt));
+    await Store.savePoints(_points);
+    HapticFeedback.heavyImpact();
+    if (mounted) _openPoint(pt);
+  }
+
+  void _openPoint(SavedPoint pt) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (ctx) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: SafeArea(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(18, 0, 18, 18),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  pt.name,
+                  style: const TextStyle(
+                    fontSize: 19,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  '${_methodLabel(pt.method)} • ±${pt.acc.toStringAsFixed(1)} م'
+                  '${pt.steps > 0 ? ' • ${pt.steps} خطوة (${pt.walked.toStringAsFixed(0)} م)' : ''}',
+                  style: TextStyle(color: _accColor(pt.acc), fontSize: 13),
+                ),
+                if (pt.photoPath != null && !kIsWeb) ...[
+                  const SizedBox(height: 10),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(14),
+                    child: Image.file(
+                      File(pt.photoPath!),
+                      height: 220,
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, _, _) => const SizedBox.shrink(),
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 10),
+                if (pt.address != null)
+                  Text(pt.address!, style: const TextStyle(fontSize: 15)),
+                const SizedBox(height: 6),
+                Directionality(
+                  textDirection: TextDirection.ltr,
+                  child: SelectableText(
+                    pt.coords,
+                    style: const TextStyle(
+                      fontFamily: 'monospace',
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+                Text(
+                  '${pt.time.year}/${pt.time.month}/${pt.time.day} '
+                  '${pt.time.hour.toString().padLeft(2, '0')}:${pt.time.minute.toString().padLeft(2, '0')}',
+                  style: const TextStyle(color: Colors.black54, fontSize: 12),
+                ),
+                const SizedBox(height: 14),
+                FilledButton.icon(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: const Color(0xFF25D366),
+                    minimumSize: const Size.fromHeight(48),
+                  ),
+                  onPressed: () => _whatsappText(
+                    _shareTextOf(
+                      lat: pt.lat,
+                      lng: pt.lng,
+                      acc: pt.acc,
+                      address: pt.address,
+                      title: '📍 ${pt.name}',
+                    ),
+                  ),
+                  icon: const Icon(Icons.chat),
+                  label: const Text('إرسال عبر واتساب'),
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: () {
+                          final text = _shareTextOf(
+                            lat: pt.lat,
+                            lng: pt.lng,
+                            acc: pt.acc,
+                            address: pt.address,
+                            title: '📍 ${pt.name}',
+                          );
+                          SharePlus.instance.share(
+                            ShareParams(
+                              text: text,
+                              files: pt.photoPath != null && !kIsWeb
+                                  ? [XFile(pt.photoPath!)]
+                                  : null,
+                            ),
+                          );
+                        },
+                        icon: const Icon(Icons.share),
+                        label: Text(
+                          pt.photoPath != null ? 'مشاركة مع الصورة' : 'مشاركة',
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: () => launchUrl(
+                          Uri.parse(pt.mapsLink),
+                          mode: LaunchMode.externalApplication,
+                        ),
+                        icon: const Icon(Icons.map),
+                        label: const Text('فتح بالخرائط'),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextButton.icon(
+                        onPressed: () {
+                          Navigator.pop(ctx);
+                          _map.move(LatLng(pt.lat, pt.lng), 19);
+                          setState(() => _follow = false);
+                        },
+                        icon: const Icon(Icons.center_focus_strong),
+                        label: const Text('عرض على الخريطة'),
+                      ),
+                    ),
+                    Expanded(
+                      child: TextButton.icon(
+                        style: TextButton.styleFrom(
+                          foregroundColor: Colors.red,
+                        ),
+                        onPressed: () async {
+                          Navigator.pop(ctx);
+                          setState(
+                            () => _points.removeWhere((e) => e.id == pt.id),
+                          );
+                          await Store.savePoints(_points);
+                          if (pt.photoPath != null && !kIsWeb) {
+                            try {
+                              File(pt.photoPath!).deleteSync();
+                            } catch (_) {}
+                          }
+                        },
+                        icon: const Icon(Icons.delete_outline),
+                        label: const Text('حذف'),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }
 
-  Color _accColor(double acc) {
-    if (acc <= 10) return const Color(0xFF16A34A);
-    if (acc <= 30) return const Color(0xFF65A30D);
-    if (acc <= 100) return const Color(0xFFF59E0B);
-    return const Color(0xFFDC2626);
+  void _openPointsList() {
+    showModalBottomSheet(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: SafeArea(
+          child: _points.isEmpty
+              ? const Padding(
+                  padding: EdgeInsets.all(30),
+                  child: Text(
+                    'ما في نقاط محفوظة بعد.\nاضغط "تحديد النقطة" أو "لقطة + نقطة".',
+                    textAlign: TextAlign.center,
+                  ),
+                )
+              : ListView.separated(
+                  shrinkWrap: true,
+                  itemCount: _points.length,
+                  separatorBuilder: (_, _) => const Divider(height: 1),
+                  itemBuilder: (_, i) {
+                    final pt = _points[i];
+                    return ListTile(
+                      leading: CircleAvatar(
+                        backgroundColor: _accColor(
+                          pt.acc,
+                        ).withValues(alpha: 0.15),
+                        child: Icon(
+                          pt.photoPath != null
+                              ? Icons.photo_camera
+                              : Icons.place,
+                          color: _accColor(pt.acc),
+                        ),
+                      ),
+                      title: Text(pt.name),
+                      subtitle: Text(
+                        '±${pt.acc.toStringAsFixed(1)} م • ${_methodLabel(pt.method)}',
+                      ),
+                      onTap: () {
+                        Navigator.pop(ctx);
+                        _openPoint(pt);
+                      },
+                    );
+                  },
+                ),
+        ),
+      ),
+    );
   }
 
-  String _accLabel(double acc) {
-    if (acc <= 10) return 'دقة ممتازة';
-    if (acc <= 30) return 'دقة جيدة';
-    if (acc <= 100) return 'دقة متوسطة';
-    return 'دقة ضعيفة';
+  // ---------------------------------------------------------------- updates
+  Future<void> _checkUpdate({bool silent = false}) async {
+    if (!_android) {
+      if (!silent) _snack('التحديث التلقائي متاح في تطبيق أندرويد فقط');
+      return;
+    }
+    try {
+      final u = await Updater.check();
+      if (!mounted) return;
+      setState(() => _update = u);
+      if (u == null) {
+        if (!silent) _snack('عندك آخر إصدار ($_version) ✅');
+      } else if (!silent) {
+        _runUpdate();
+      }
+    } catch (e) {
+      if (!silent) _snack('تعذر فحص التحديث: $e');
+    }
   }
 
+  Future<void> _runUpdate() async {
+    final u = _update;
+    if (u == null || _updProgress != null) return;
+    setState(() => _updProgress = 0);
+    try {
+      final r = await Updater.downloadAndInstall(u, (p) {
+        if (mounted) setState(() => _updProgress = p);
+      });
+      if (!mounted) return;
+      if (r == 'need_permission') {
+        _snack('اسمح بـ "تثبيت التطبيقات" لموقعي الآن، ثم ارجع واضغط تحديث');
+      } else if (r != 'ok') {
+        _snack('فشل التحديث: $r');
+      }
+    } catch (e) {
+      _snack('فشل التنزيل: $e');
+    } finally {
+      if (mounted) setState(() => _updProgress = null);
+    }
+  }
+
+  void _openSettings() {
+    showModalBottomSheet(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setS) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: SafeArea(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(18, 0, 18, 18),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Text(
+                    'وضع التتبع بعد التثبيت',
+                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                  ),
+                  const SizedBox(height: 8),
+                  SegmentedButton<FusionMode>(
+                    segments: const [
+                      ButtonSegment(
+                        value: FusionMode.hybrid,
+                        label: Text('دمج (الأدق)'),
+                        icon: Icon(Icons.merge_type),
+                      ),
+                      ButtonSegment(
+                        value: FusionMode.sensors,
+                        label: Text('حساسات فقط'),
+                        icon: Icon(Icons.directions_walk),
+                      ),
+                    ],
+                    selected: {_eng.mode},
+                    onSelectionChanged: (s) {
+                      _eng.mode = s.first;
+                      _saveCal();
+                      setS(() {});
+                      setState(() {});
+                    },
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    _eng.mode == FusionMode.hybrid
+                        ? 'الحساسات تحسب كل خطوة، والـ GPS الجيد يصحّح الانحراف ويعاير طول خطوتك واتجاه البوصلة تلقائياً.'
+                        : 'بعد التثبيت الأول يعتمد فقط على حساسات الهاتف (الخطوات + الاتجاه). مفيد داخل المباني. الخطأ يتراكم مع المسافة (~2–5٪).',
+                    style: const TextStyle(
+                      fontSize: 12.5,
+                      color: Colors.black54,
+                    ),
+                  ),
+                  const Divider(height: 28),
+                  const Text(
+                    'المعايرة',
+                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    'معامل طول الخطوة K = ${_eng.stepK.toStringAsFixed(3)}\n'
+                    'تصحيح البوصلة = ${_eng.headingBiasDeg.toStringAsFixed(1)}°\n'
+                    'عدد المعايرات التلقائية = ${_eng.calibrations}',
+                    style: const TextStyle(fontSize: 13.5, height: 1.6),
+                  ),
+                  const SizedBox(height: 4),
+                  const Text(
+                    'تتعاير تلقائياً لما تمشي في خط مستقيم 30م+ والـ GPS دقيق (≤8م) في وضع الدمج.',
+                    style: TextStyle(fontSize: 12, color: Colors.black54),
+                  ),
+                  TextButton(
+                    onPressed: () {
+                      _eng.stepK = 0.5;
+                      _eng.headingBiasDeg = 0;
+                      _eng.calibrations = 0;
+                      _saveCal();
+                      setS(() {});
+                    },
+                    child: const Text('إعادة ضبط المعايرة'),
+                  ),
+                  const Divider(height: 20),
+                  Row(
+                    children: [
+                      const Icon(Icons.system_update, color: kPrimary),
+                      const SizedBox(width: 8),
+                      Expanded(child: Text('الإصدار الحالي: $_version')),
+                      FilledButton(
+                        onPressed: () {
+                          Navigator.pop(ctx);
+                          _checkUpdate();
+                        },
+                        child: const Text('فحص التحديث'),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------- UI
   @override
   Widget build(BuildContext context) {
-    final p = _pos;
-    final ll = p == null
-        ? const LatLng(24.7136, 46.6753)
-        : LatLng(p.latitude, p.longitude);
+    final has = _eng.hasPosition;
+    final pos = has ? _eng.position : null;
+    final ll = pos == null
+        ? const LatLng(15.3694, 44.1910)
+        : LatLng(pos.lat, pos.lng);
     return Scaffold(
       body: Stack(
         children: [
@@ -411,25 +835,35 @@ class _LocationScreenState extends State<LocationScreen> {
               mapController: _map,
               options: MapOptions(
                 initialCenter: ll,
-                initialZoom: p == null ? 5 : 17,
-                onMapReady: () {
-                  _mapReady = true;
-                  if (_pos != null) {
-                    _map.move(LatLng(_pos!.latitude, _pos!.longitude), 17);
-                  }
+                initialZoom: has ? 18 : 5,
+                maxZoom: 20,
+                onMapReady: () => _mapReady = true,
+                onPositionChanged: (_, gesture) {
+                  if (gesture && _follow) setState(() => _follow = false);
                 },
               ),
               children: [
                 TileLayer(
                   urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
                   userAgentPackageName: 'com.mawqianow.location',
+                  maxNativeZoom: 19,
                 ),
-                if (p != null)
+                if (_trail.length > 1)
+                  PolylineLayer(
+                    polylines: [
+                      Polyline(
+                        points: _trail,
+                        strokeWidth: 4,
+                        color: const Color(0xFF2563EB).withValues(alpha: 0.7),
+                      ),
+                    ],
+                  ),
+                if (has)
                   CircleLayer(
                     circles: [
                       CircleMarker(
                         point: ll,
-                        radius: p.accuracy,
+                        radius: _eng.accuracy,
                         useRadiusInMeter: true,
                         color: kPrimary.withValues(alpha: 0.15),
                         borderColor: kPrimary.withValues(alpha: 0.5),
@@ -437,90 +871,51 @@ class _LocationScreenState extends State<LocationScreen> {
                       ),
                     ],
                   ),
-                if (p != null)
-                  MarkerLayer(
-                    markers: [
+                MarkerLayer(
+                  markers: [
+                    for (final pt in _points)
                       Marker(
-                        point: ll,
-                        width: 28,
-                        height: 28,
-                        child: Container(
-                          decoration: BoxDecoration(
-                            color: const Color(0xFF2563EB),
-                            shape: BoxShape.circle,
-                            border: Border.all(color: Colors.white, width: 4),
-                            boxShadow: const [
-                              BoxShadow(color: Colors.black26, blurRadius: 6),
-                            ],
+                        point: LatLng(pt.lat, pt.lng),
+                        width: 30,
+                        height: 30,
+                        child: GestureDetector(
+                          onTap: () => _openPoint(pt),
+                          child: Icon(
+                            pt.photoPath != null
+                                ? Icons.photo_camera
+                                : Icons.location_on,
+                            color: const Color(0xFFDC2626),
+                            size: 28,
                           ),
                         ),
                       ),
-                    ],
-                  ),
+                    if (has)
+                      Marker(
+                        point: ll,
+                        width: 60,
+                        height: 60,
+                        child: _UserDot(heading: _heading),
+                      ),
+                  ],
+                ),
               ],
             ),
           ),
-          SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: Row(
-                children: [
-                  _pill(
-                    child: const Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(Icons.my_location, color: kPrimary, size: 20),
-                        SizedBox(width: 6),
-                        Text(
-                          'موقعي الآن',
-                          style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 16,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  const Spacer(),
-                  if (p != null)
-                    _pill(
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            Icons.gps_fixed,
-                            size: 16,
-                            color: _accColor(p.accuracy),
-                          ),
-                          const SizedBox(width: 4),
-                          Text(
-                            '±${p.accuracy.round()} م',
-                            style: TextStyle(
-                              fontWeight: FontWeight.bold,
-                              color: _accColor(p.accuracy),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                ],
-              ),
-            ),
-          ),
+          SafeArea(child: _topBar()),
           Positioned(
-            left: 16,
-            bottom: 330,
+            left: 14,
+            bottom: 380,
             child: FloatingActionButton.small(
-              heroTag: 'center',
-              backgroundColor: Colors.white,
+              heroTag: 'follow',
+              backgroundColor: _follow ? kPrimary : Colors.white,
               onPressed: () {
-                if (_pos != null) {
-                  _map.move(LatLng(_pos!.latitude, _pos!.longitude), 17);
-                } else {
-                  _start();
-                }
+                setState(() => _follow = true);
+                if (has) _map.move(ll, math.max(_map.camera.zoom, 18));
               },
-              child: const Icon(Icons.my_location, color: kPrimary),
+              child: Icon(
+                Icons.my_location,
+                color: _follow ? Colors.white : kPrimary,
+              ),
             ),
           ),
           Align(alignment: Alignment.bottomCenter, child: _panel()),
@@ -529,18 +924,110 @@ class _LocationScreenState extends State<LocationScreen> {
     );
   }
 
-  Widget _pill({required Widget child}) => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-    decoration: BoxDecoration(
-      color: Colors.white,
-      borderRadius: BorderRadius.circular(30),
-      boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 8)],
-    ),
-    child: child,
-  );
+  Widget _pill({required Widget child, VoidCallback? onTap, Color? color}) =>
+      Material(
+        color: color ?? Colors.white,
+        borderRadius: BorderRadius.circular(30),
+        elevation: 3,
+        shadowColor: Colors.black26,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(30),
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+            child: child,
+          ),
+        ),
+      );
+
+  Widget _topBar() {
+    final updating = _updProgress != null;
+    final hasUpd = _update != null;
+    return Padding(
+      padding: const EdgeInsets.all(10),
+      child: Row(
+        children: [
+          _pill(
+            child: const Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.my_location, color: kPrimary, size: 19),
+                SizedBox(width: 5),
+                Text(
+                  'موقعي الآن',
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+                ),
+              ],
+            ),
+          ),
+          const Spacer(),
+          // auto-update button
+          _pill(
+            color: hasUpd ? const Color(0xFFF59E0B) : null,
+            onTap: updating
+                ? null
+                : (hasUpd ? _runUpdate : () => _checkUpdate()),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                updating
+                    ? SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2.5,
+                          value: _updProgress == 0 ? null : _updProgress,
+                        ),
+                      )
+                    : Icon(
+                        Icons.system_update,
+                        size: 19,
+                        color: hasUpd ? Colors.white : kPrimary,
+                      ),
+                const SizedBox(width: 5),
+                Text(
+                  updating
+                      ? '${((_updProgress ?? 0) * 100).round()}%'
+                      : hasUpd
+                      ? 'تحديث ${_update!.version}'
+                      : 'تحديث',
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 13,
+                    color: hasUpd ? Colors.white : Colors.black87,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 6),
+          _pill(
+            onTap: _openPointsList,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.bookmarks_outlined, size: 19, color: kPrimary),
+                if (_points.isNotEmpty) ...[
+                  const SizedBox(width: 4),
+                  Text(
+                    '${_points.length}',
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(width: 6),
+          _pill(
+            onTap: _openSettings,
+            child: const Icon(Icons.tune, size: 19, color: kPrimary),
+          ),
+        ],
+      ),
+    );
+  }
 
   Widget _panel() {
-    final p = _pos;
     return Container(
       width: double.infinity,
       constraints: const BoxConstraints(maxWidth: 600),
@@ -549,7 +1036,7 @@ class _LocationScreenState extends State<LocationScreen> {
         borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
         boxShadow: [BoxShadow(color: Colors.black26, blurRadius: 16)],
       ),
-      padding: const EdgeInsets.fromLTRB(18, 12, 18, 18),
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 14),
       child: SafeArea(
         top: false,
         child: Column(
@@ -566,13 +1053,13 @@ class _LocationScreenState extends State<LocationScreen> {
                 ),
               ),
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 10),
             if (_error != null)
               ..._errorView()
-            else if (p == null)
-              ..._loadingView()
-            else
-              ..._infoView(p),
+            else ...[
+              _phaseCard(),
+              if (_eng.hasPosition) ..._infoView(),
+            ],
           ],
         ),
       ),
@@ -599,181 +1086,21 @@ class _LocationScreenState extends State<LocationScreen> {
     ),
   ];
 
-  List<Widget> _loadingView() => [
-    if (_nativeGps) ...[_gnssBar(), const SizedBox(height: 10)],
-    const SizedBox(height: 8),
-    const Center(child: CircularProgressIndicator(color: kPrimary)),
-    const SizedBox(height: 14),
-    const Text(
-      'جاري تحديد موقعك بدقة...',
-      textAlign: TextAlign.center,
-      style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
-    ),
-    const SizedBox(height: 4),
-    const Text(
-      'للحصول على أفضل دقة، كن في مكان مفتوح',
-      textAlign: TextAlign.center,
-      style: TextStyle(color: Colors.black54),
-    ),
-    const SizedBox(height: 16),
-  ];
-
-  List<Widget> _infoView(Position p) => [
-    Row(
-      children: [
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-          decoration: BoxDecoration(
-            color: _accColor(p.accuracy).withValues(alpha: 0.12),
-            borderRadius: BorderRadius.circular(20),
-          ),
-          child: Text(
-            '${_accLabel(p.accuracy)} • ±${p.accuracy.round()} متر',
-            style: TextStyle(
-              color: _accColor(p.accuracy),
-              fontWeight: FontWeight.bold,
-              fontSize: 12.5,
-            ),
-          ),
-        ),
-        const Spacer(),
-        if (_searching)
-          const Row(
-            children: [
-              SizedBox(
-                width: 12,
-                height: 12,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              ),
-              SizedBox(width: 6),
-              Text('يحسّن الدقة', style: TextStyle(fontSize: 12)),
-            ],
-          ),
-      ],
-    ),
-    if (_nativeGps) ...[const SizedBox(height: 10), _gnssBar()],
-    if (p.isMocked)
-      const Padding(
-        padding: EdgeInsets.only(top: 8),
-        child: Text(
-          '⚠️ تنبيه: الموقع صادر من تطبيق موقع وهمي (Mock)',
-          style: TextStyle(color: Color(0xFFDC2626), fontSize: 12.5),
-        ),
-      ),
-    const SizedBox(height: 12),
-    InkWell(
-      onTap: _address == null ? null : () => _copy(_address!, 'العنوان'),
-      borderRadius: BorderRadius.circular(12),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Icon(Icons.place, color: kPrimary, size: 26),
-          const SizedBox(width: 8),
-          Expanded(
-            child: _address == null
-                ? Text(
-                    _loadingAddress
-                        ? 'جاري جلب العنوان...'
-                        : 'العنوان غير متاح',
-                    style: const TextStyle(color: Colors.black54, fontSize: 15),
-                  )
-                : Text(
-                    _address!,
-                    style: const TextStyle(
-                      fontSize: 16.5,
-                      fontWeight: FontWeight.w700,
-                      height: 1.4,
-                    ),
-                  ),
-          ),
-        ],
-      ),
-    ),
-    const SizedBox(height: 10),
-    Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        color: const Color(0xFFF1F5F4),
-        borderRadius: BorderRadius.circular(12),
-      ),
-      child: Row(
-        children: [
-          const Icon(Icons.explore_outlined, size: 18, color: Colors.black54),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Directionality(
-              textDirection: TextDirection.ltr,
-              child: Text(
-                _coords,
-                style: const TextStyle(
-                  fontFamily: 'monospace',
-                  fontSize: 14.5,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ),
-          ),
-          IconButton(
-            tooltip: 'نسخ الإحداثيات',
-            visualDensity: VisualDensity.compact,
-            icon: const Icon(Icons.copy, size: 18),
-            onPressed: () => _copy(_coords, 'الإحداثيات'),
-          ),
-        ],
-      ),
-    ),
-    const SizedBox(height: 14),
-    SizedBox(
-      height: 52,
-      child: FilledButton.icon(
-        onPressed: _whatsapp,
-        style: FilledButton.styleFrom(
-          backgroundColor: const Color(0xFF25D366),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(14),
-          ),
-        ),
-        icon: const Icon(Icons.chat, color: Colors.white),
-        label: const Text(
-          'إرسال عبر واتساب',
-          style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-        ),
-      ),
-    ),
-    const SizedBox(height: 10),
-    Row(
-      children: [
-        Expanded(child: _smallBtn(Icons.share, 'مشاركة', _share)),
-        const SizedBox(width: 8),
-        Expanded(
-          child: _smallBtn(
-            Icons.link,
-            'نسخ الرابط',
-            () => _copy(_mapsLink, 'الرابط'),
-          ),
-        ),
-        const SizedBox(width: 8),
-        Expanded(child: _smallBtn(Icons.map, 'فتح بالخرائط', _openMaps)),
-      ],
-    ),
-  ];
-
-  Widget _gnssBar() {
-    final good = _satUsed >= 8;
-    final c = _satUsed == 0
-        ? const Color(0xFFDC2626)
-        : good
-        ? const Color(0xFF16A34A)
-        : const Color(0xFFF59E0B);
-    final names = _constellations.entries
+  /// Phase card: acquiring (progress to lock) or tracking (steps/heading).
+  Widget _phaseCard() {
+    final acq = _eng.phase != Phase.tracking;
+    final acc = _eng.accuracy;
+    final c = _eng.hasPosition ? _accColor(acc) : Colors.black45;
+    final secs = _eng.acquiringFor(DateTime.now()).inSeconds;
+    final names = _consts.entries
         .where((e) => e.value.length > 1 && e.value[1] > 0)
         .map((e) => '${e.key} ${e.value[1]}')
         .join(' • ');
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: c.withValues(alpha: 0.08),
-        borderRadius: BorderRadius.circular(12),
+        color: c.withValues(alpha: 0.07),
+        borderRadius: BorderRadius.circular(14),
         border: Border.all(color: c.withValues(alpha: 0.25)),
       ),
       child: Column(
@@ -781,75 +1108,340 @@ class _LocationScreenState extends State<LocationScreen> {
         children: [
           Row(
             children: [
-              Icon(Icons.satellite_alt, size: 18, color: c),
+              Icon(
+                acq
+                    ? Icons.satellite_alt
+                    : (_eng.mode == FusionMode.sensors
+                          ? Icons.directions_walk
+                          : Icons.merge_type),
+                color: c,
+                size: 20,
+              ),
               const SizedBox(width: 6),
-              Text(
-                'GPS الهاتف • أقمار مستخدمة $_satUsed من $_satVisible',
-                style: TextStyle(
-                  color: c,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 13,
+              Expanded(
+                child: Text(
+                  acq
+                      ? 'المرحلة 1: تثبيت دقيق (GPS + Google) • $secs ث'
+                      : 'المرحلة 2: ${_methodLabel(_method)}',
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    color: c,
+                    fontSize: 13.5,
+                  ),
                 ),
               ),
-              const Spacer(),
-              if (_avgCn0 > 0)
+              if (_eng.hasPosition)
                 Text(
-                  '${_avgCn0.toStringAsFixed(0)} dB-Hz',
-                  style: const TextStyle(fontSize: 11.5, color: Colors.black54),
+                  '±${acc.toStringAsFixed(1)} م',
+                  style: TextStyle(
+                    fontWeight: FontWeight.w900,
+                    color: c,
+                    fontSize: 15,
+                  ),
                 ),
             ],
           ),
-          if (names.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.only(top: 3),
-              child: Directionality(
-                textDirection: TextDirection.ltr,
-                child: Text(
-                  names,
-                  style: const TextStyle(fontSize: 11.5, color: Colors.black54),
+          const SizedBox(height: 6),
+          if (acq) ...[
+            ClipRRect(
+              borderRadius: BorderRadius.circular(6),
+              child: LinearProgressIndicator(
+                minHeight: 6,
+                value: !_eng.hasPosition
+                    ? null
+                    : (_eng.lockTargetAcc / acc).clamp(0.05, 1.0),
+                color: c,
+                backgroundColor: c.withValues(alpha: 0.12),
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              !_eng.hasPosition
+                  ? 'يبحث عن الأقمار... اطلع لمكان مفتوح وثبّت الجوال'
+                  : 'ثبّت الجوال • ${_eng.acqSamples} قراءة • أفضل قراءة ±${_eng.bestFixAcc.toStringAsFixed(1)}م • الهدف ±${_eng.lockTargetAcc.toStringAsFixed(0)}م',
+              style: const TextStyle(fontSize: 12, color: Colors.black54),
+            ),
+            if (_eng.hasPosition && secs >= 8)
+              Align(
+                alignment: AlignmentDirectional.centerEnd,
+                child: TextButton(
+                  onPressed: () => setState(_eng.forceLock),
+                  child: const Text('ثبّت الآن وابدأ التتبع'),
                 ),
               ),
+          ] else ...[
+            Row(
+              children: [
+                _stat(Icons.directions_walk, '${_eng.steps}', 'خطوة'),
+                _stat(Icons.straighten, _eng.walked.toStringAsFixed(1), 'متر'),
+                _stat(
+                  Icons.explore,
+                  _heading == null ? '—' : '${_heading!.round()}°',
+                  _headingSrc == 'google' ? 'Google' : 'بوصلة',
+                ),
+                _stat(Icons.adjust, '±${_headingErr.round()}°', 'خطأ الاتجاه'),
+              ],
             ),
-          if (_samples.length > 1)
-            Padding(
-              padding: const EdgeInsets.only(top: 3),
-              child: Text(
-                'متوسط ${_samples.length} قراءة (ثبّت الجوال لدقة أعلى)'
-                '${_raw != null ? ' • آخر قراءة ±${_raw!.accuracy.toStringAsFixed(1)}م' : ''}',
-                style: const TextStyle(fontSize: 11.5, color: Colors.black54),
+            Align(
+              alignment: AlignmentDirectional.centerEnd,
+              child: TextButton.icon(
+                onPressed: () {
+                  _trail.clear();
+                  setState(() => _eng.relock(DateTime.now()));
+                },
+                icon: const Icon(Icons.gps_fixed, size: 16),
+                label: const Text('إعادة التثبيت بالـ GPS'),
               ),
             ),
-          if (_satUsed == 0)
-            const Padding(
-              padding: EdgeInsets.only(top: 3),
-              child: Text(
-                'يبحث عن الأقمار... اطلع لمكان مفتوح بعيداً عن السقف',
-                style: TextStyle(fontSize: 11.5),
-              ),
+          ],
+          if (_android)
+            Text(
+              'أقمار: $_satUsed/$_satVisible'
+              '${_cn0 > 0 ? ' • ${_cn0.toStringAsFixed(0)} dB-Hz' : ''}'
+              '${names.isNotEmpty ? ' • $names' : ''}',
+              textDirection: TextDirection.ltr,
+              style: const TextStyle(fontSize: 11, color: Colors.black54),
+            ),
+          if (_eng.mockDetected)
+            const Text(
+              '⚠️ تم رصد موقع وهمي (Mock) — النتيجة غير موثوقة',
+              style: TextStyle(color: Color(0xFFDC2626), fontSize: 12),
             ),
         ],
       ),
     );
   }
 
-  Widget _smallBtn(IconData icon, String label, VoidCallback onTap) =>
-      OutlinedButton(
-        onPressed: onTap,
-        style: OutlinedButton.styleFrom(
-          padding: const EdgeInsets.symmetric(vertical: 10),
-          foregroundColor: kPrimary,
-          side: const BorderSide(color: Color(0xFFCFE3DC)),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(14),
-          ),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
+  Widget _stat(IconData i, String v, String l) => Expanded(
+    child: Column(
+      children: [
+        Icon(i, size: 18, color: kPrimary),
+        Text(v, style: const TextStyle(fontWeight: FontWeight.bold)),
+        Text(l, style: const TextStyle(fontSize: 10.5, color: Colors.black54)),
+      ],
+    ),
+  );
+
+  List<Widget> _infoView() {
+    final p = _eng.position;
+    final coords = _coordsOf(p.lat, p.lng);
+    return [
+      const SizedBox(height: 10),
+      InkWell(
+        onTap: _address == null ? null : () => _copy(_address!, 'العنوان'),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Icon(icon, size: 20),
-            const SizedBox(height: 2),
-            Text(label, style: const TextStyle(fontSize: 12)),
+            const Icon(Icons.place, color: kPrimary, size: 22),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text(
+                _address ??
+                    (_loadingAddress
+                        ? 'جاري جلب العنوان...'
+                        : 'العنوان غير متاح'),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: _address == null
+                      ? FontWeight.normal
+                      : FontWeight.w700,
+                  color: _address == null ? Colors.black54 : Colors.black87,
+                ),
+              ),
+            ),
           ],
         ),
-      );
+      ),
+      const SizedBox(height: 6),
+      Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10),
+        decoration: BoxDecoration(
+          color: const Color(0xFFF1F5F4),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: Text(
+                coords,
+                textDirection: TextDirection.ltr,
+                style: const TextStyle(
+                  fontFamily: 'monospace',
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+            IconButton(
+              visualDensity: VisualDensity.compact,
+              icon: const Icon(Icons.copy, size: 18),
+              onPressed: () => _copy(coords, 'الإحداثيات'),
+            ),
+          ],
+        ),
+      ),
+      const SizedBox(height: 10),
+      Row(
+        children: [
+          Expanded(
+            child: SizedBox(
+              height: 52,
+              child: FilledButton.icon(
+                onPressed: () => _capture(withPhoto: false),
+                style: FilledButton.styleFrom(
+                  backgroundColor: kPrimary,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                ),
+                icon: const Icon(Icons.add_location_alt),
+                label: const Text(
+                  'تحديد النقطة',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: SizedBox(
+              height: 52,
+              child: FilledButton.icon(
+                onPressed: () => _capture(withPhoto: true),
+                style: FilledButton.styleFrom(
+                  backgroundColor: const Color(0xFF2563EB),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                ),
+                icon: const Icon(Icons.photo_camera),
+                label: const Text(
+                  'لقطة + نقطة',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+      const SizedBox(height: 8),
+      Row(
+        children: [
+          Expanded(
+            child: _smallBtn(
+              Icons.chat,
+              'واتساب',
+              () => _whatsappText(_shareText),
+              color: const Color(0xFF128C7E),
+            ),
+          ),
+          const SizedBox(width: 6),
+          Expanded(
+            child: _smallBtn(
+              Icons.share,
+              'مشاركة',
+              () => SharePlus.instance.share(ShareParams(text: _shareText)),
+            ),
+          ),
+          const SizedBox(width: 6),
+          Expanded(
+            child: _smallBtn(
+              Icons.link,
+              'نسخ الرابط',
+              () => _copy(_linkOf(p.lat, p.lng), 'الرابط'),
+            ),
+          ),
+          const SizedBox(width: 6),
+          Expanded(
+            child: _smallBtn(
+              Icons.map,
+              'الخرائط',
+              () => launchUrl(
+                Uri.parse(_linkOf(p.lat, p.lng)),
+                mode: LaunchMode.externalApplication,
+              ),
+            ),
+          ),
+        ],
+      ),
+    ];
+  }
+
+  Widget _smallBtn(
+    IconData icon,
+    String label,
+    VoidCallback onTap, {
+    Color color = kPrimary,
+  }) => OutlinedButton(
+    onPressed: onTap,
+    style: OutlinedButton.styleFrom(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      foregroundColor: color,
+      side: const BorderSide(color: Color(0xFFCFE3DC)),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+    ),
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, size: 19),
+        Text(label, style: const TextStyle(fontSize: 11)),
+      ],
+    ),
+  );
+}
+
+class _UserDot extends StatelessWidget {
+  final double? heading;
+  const _UserDot({this.heading});
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      alignment: Alignment.center,
+      children: [
+        if (heading != null)
+          Transform.rotate(
+            angle: heading! * math.pi / 180,
+            child: CustomPaint(size: const Size(60, 60), painter: _Cone()),
+          ),
+        Container(
+          width: 22,
+          height: 22,
+          decoration: BoxDecoration(
+            color: const Color(0xFF2563EB),
+            shape: BoxShape.circle,
+            border: Border.all(color: Colors.white, width: 4),
+            boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 6)],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _Cone extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size s) {
+    final c = Offset(s.width / 2, s.height / 2);
+    final path = Path()
+      ..moveTo(c.dx, c.dy)
+      ..lineTo(c.dx - 13, 2)
+      ..quadraticBezierTo(c.dx, -4, c.dx + 13, 2)
+      ..close();
+    canvas.drawPath(
+      path,
+      Paint()
+        ..shader = RadialGradient(
+          colors: [
+            const Color(0xFF2563EB).withValues(alpha: 0.55),
+            const Color(0xFF2563EB).withValues(alpha: 0.0),
+          ],
+        ).createShader(Rect.fromCircle(center: c, radius: s.width / 2)),
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }

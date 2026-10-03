@@ -2,3 +2,6 @@
 -keep class com.baseflow.geolocator.** { *; }
 -dontwarn com.google.android.play.core.**
 -dontwarn io.flutter.embedding.**
+-keep class com.mawqianow.location.** { *; }
+-keep class com.google.android.gms.location.** { *; }
+-keep class androidx.core.content.FileProvider { *; }
