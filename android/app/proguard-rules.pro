@@ -1,0 +1,4 @@
+-keep class io.flutter.** { *; }
+-keep class com.baseflow.geolocator.** { *; }
+-dontwarn com.google.android.play.core.**
+-dontwarn io.flutter.embedding.**
