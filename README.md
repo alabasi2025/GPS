@@ -80,7 +80,7 @@ https://github.com/alabasi2025/GPS/releases/latest/download/mawqi-now.apk
 
 الواجهة: Material 3، اتجاه RTL، الكود كاملاً في `lib/main.dart`.
 
-## ⚙️ آلية الدقة (v1.1.0 — GPS الهاتف الخام)
+## ⚙️ (تاريخي) آلية v1.1.0 — استُبدلت في v1.2.0 بمحرك Kalman + PDR (انظر docs/ALGORITHMS.md)
 
 **أندرويد:** القراءة مباشرة من شريحة GNSS عبر كود Kotlin أصلي في `MainActivity.kt`:
 1. `LocationManager.GPS_PROVIDER` فقط — **بدون** Wi-Fi/أبراج/Fused (لا خلط بمصادر تقريبية).
