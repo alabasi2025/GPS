@@ -46,7 +46,17 @@ class LocationScreen extends StatefulWidget {
 class _LocationScreenState extends State<LocationScreen> {
   final MapController _map = MapController();
   StreamSubscription<Position>? _sub;
+  StreamSubscription<dynamic>? _gpsSub;
+  static const _gpsEvents = EventChannel('mawqi/gps');
   Position? _pos;
+  Position? _raw; // latest raw fix from the GPS chip
+  final List<Position> _samples = []; // stationary samples for averaging
+  int _satUsed = 0;
+  int _satVisible = 0;
+  double _avgCn0 = 0;
+  Map<String, List<int>> _constellations = {};
+  bool get _nativeGps =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
   String? _address;
   bool _loadingAddress = false;
   String? _error;
@@ -63,6 +73,7 @@ class _LocationScreenState extends State<LocationScreen> {
   @override
   void dispose() {
     _sub?.cancel();
+    _gpsSub?.cancel();
     super.dispose();
   }
 
@@ -115,13 +126,12 @@ class _LocationScreenState extends State<LocationScreen> {
         return;
       }
 
-      // Show last known position instantly (Android) while GPS warms up.
-      if (!kIsWeb && _pos == null) {
-        final last = await Geolocator.getLastKnownPosition();
-        if (last != null && mounted) _onPosition(last, fromCache: true);
-      }
-
       await _sub?.cancel();
+      await _gpsSub?.cancel();
+      if (_nativeGps) {
+        _listenNativeGps();
+        return;
+      }
       _sub = Geolocator.getPositionStream(locationSettings: _settings).listen(
         _onPosition,
         onError: (e) {
@@ -140,26 +150,127 @@ class _LocationScreenState extends State<LocationScreen> {
     }
   }
 
+  /// Android: raw GPS chip (LocationManager.GPS_PROVIDER) + GNSS satellites.
+  void _listenNativeGps() {
+    _gpsSub = _gpsEvents.receiveBroadcastStream().listen(
+      (e) {
+        final m = Map<String, dynamic>.from(e as Map);
+        switch (m['type']) {
+          case 'gnss':
+            if (!mounted) return;
+            setState(() {
+              _satVisible = (m['visible'] as num?)?.toInt() ?? 0;
+              _satUsed = (m['used'] as num?)?.toInt() ?? 0;
+              _avgCn0 = (m['avgCn0'] as num?)?.toDouble() ?? 0;
+              _constellations = (m['constellations'] as Map? ?? {}).map(
+                (k, v) => MapEntry(
+                  k as String,
+                  (v as List).map((x) => (x as num).toInt()).toList(),
+                ),
+              );
+            });
+          case 'location':
+            final acc = (m['acc'] as num?)?.toDouble() ?? 9999;
+            final p = Position(
+              latitude: (m['lat'] as num).toDouble(),
+              longitude: (m['lng'] as num).toDouble(),
+              timestamp: DateTime.fromMillisecondsSinceEpoch(
+                (m['time'] as num).toInt(),
+              ),
+              accuracy: acc,
+              altitude: (m['alt'] as num?)?.toDouble() ?? 0,
+              altitudeAccuracy: (m['vAcc'] as num?)?.toDouble() ?? 0,
+              heading: (m['bearing'] as num?)?.toDouble() ?? 0,
+              headingAccuracy: 0,
+              speed: (m['speed'] as num?)?.toDouble() ?? 0,
+              speedAccuracy: 0,
+              isMocked: m['mock'] == true,
+            );
+            _onPosition(p, fromCache: m['cached'] == true);
+          case 'disabled':
+            if (!mounted) return;
+            setState(() {
+              _error = 'تم إيقاف GPS. فعّله ثم اضغط "إعادة المحاولة".';
+              _searching = false;
+            });
+        }
+      },
+      onError: (e) {
+        if (!mounted) return;
+        final code = e is PlatformException ? e.code : '';
+        setState(() {
+          _error = code == 'GPS_DISABLED'
+              ? 'GPS مقفل. افتح الإعدادات وفعّل "الموقع" ثم اضغط "إعادة المحاولة".'
+              : 'تعذر تشغيل GPS: $e';
+          _searching = false;
+        });
+        if (code == 'GPS_DISABLED') Geolocator.openLocationSettings();
+      },
+    );
+  }
+
+  /// Inverse-variance weighted mean of stationary fixes -> more precise point.
+  Position _averaged() {
+    double w = 0, lat = 0, lng = 0;
+    for (final s in _samples) {
+      final wi = 1 / (s.accuracy * s.accuracy);
+      w += wi;
+      lat += s.latitude * wi;
+      lng += s.longitude * wi;
+    }
+    final last = _samples.last;
+    final best = _samples
+        .map((s) => s.accuracy)
+        .reduce((a, b) => a < b ? a : b);
+    return Position(
+      latitude: lat / w,
+      longitude: lng / w,
+      timestamp: last.timestamp,
+      accuracy: best,
+      altitude: last.altitude,
+      altitudeAccuracy: last.altitudeAccuracy,
+      heading: last.heading,
+      headingAccuracy: 0,
+      speed: last.speed,
+      speedAccuracy: 0,
+      isMocked: last.isMocked,
+    );
+  }
+
   void _onPosition(Position p, {bool fromCache = false}) {
     if (!mounted) return;
     final first = _pos == null;
-    // Keep the more accurate fix unless the new one is fresh & reasonably good,
-    // or the user has actually moved.
-    final old = _pos;
-    if (old != null && !fromCache) {
-      final moved = Geolocator.distanceBetween(
-        old.latitude,
-        old.longitude,
-        p.latitude,
-        p.longitude,
-      );
-      final better = p.accuracy <= old.accuracy;
-      if (!better && moved < p.accuracy && p.accuracy > 25) return;
+    _raw = p;
+    if (fromCache) {
+      setState(() {
+        _pos = p;
+        _searching = true;
+      });
+    } else {
+      // Reset averaging when the user is moving or jumped away.
+      if (_samples.isNotEmpty) {
+        final mean = _averaged();
+        final d = Geolocator.distanceBetween(
+          mean.latitude,
+          mean.longitude,
+          p.latitude,
+          p.longitude,
+        );
+        final moving = p.speed > 1.0;
+        if (moving || d > (p.accuracy * 1.5).clamp(8, 60)) _samples.clear();
+      }
+      if (p.accuracy <= 50) {
+        _samples.add(p);
+        if (_samples.length > 60) _samples.removeAt(0);
+      }
+      final shown = _samples.isNotEmpty ? _averaged() : p;
+      setState(() {
+        _pos = shown;
+        _searching = p.accuracy > 10;
+      });
     }
-    setState(() {
-      _pos = p;
-      _searching = p.accuracy > 20 || fromCache;
-    });
+    final p2 = _pos!;
+    p = p2;
     final ll = LatLng(p.latitude, p.longitude);
     if (_mapReady) {
       _map.move(ll, first ? 17 : _map.camera.zoom);
@@ -488,22 +599,23 @@ class _LocationScreenState extends State<LocationScreen> {
     ),
   ];
 
-  List<Widget> _loadingView() => const [
-    SizedBox(height: 8),
-    Center(child: CircularProgressIndicator(color: kPrimary)),
-    SizedBox(height: 14),
-    Text(
+  List<Widget> _loadingView() => [
+    if (_nativeGps) ...[_gnssBar(), const SizedBox(height: 10)],
+    const SizedBox(height: 8),
+    const Center(child: CircularProgressIndicator(color: kPrimary)),
+    const SizedBox(height: 14),
+    const Text(
       'جاري تحديد موقعك بدقة...',
       textAlign: TextAlign.center,
       style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
     ),
-    SizedBox(height: 4),
-    Text(
+    const SizedBox(height: 4),
+    const Text(
       'للحصول على أفضل دقة، كن في مكان مفتوح',
       textAlign: TextAlign.center,
       style: TextStyle(color: Colors.black54),
     ),
-    SizedBox(height: 16),
+    const SizedBox(height: 16),
   ];
 
   List<Widget> _infoView(Position p) => [
@@ -539,6 +651,15 @@ class _LocationScreenState extends State<LocationScreen> {
           ),
       ],
     ),
+    if (_nativeGps) ...[const SizedBox(height: 10), _gnssBar()],
+    if (p.isMocked)
+      const Padding(
+        padding: EdgeInsets.only(top: 8),
+        child: Text(
+          '⚠️ تنبيه: الموقع صادر من تطبيق موقع وهمي (Mock)',
+          style: TextStyle(color: Color(0xFFDC2626), fontSize: 12.5),
+        ),
+      ),
     const SizedBox(height: 12),
     InkWell(
       onTap: _address == null ? null : () => _copy(_address!, 'العنوان'),
@@ -636,6 +757,80 @@ class _LocationScreenState extends State<LocationScreen> {
       ],
     ),
   ];
+
+  Widget _gnssBar() {
+    final good = _satUsed >= 8;
+    final c = _satUsed == 0
+        ? const Color(0xFFDC2626)
+        : good
+        ? const Color(0xFF16A34A)
+        : const Color(0xFFF59E0B);
+    final names = _constellations.entries
+        .where((e) => e.value.length > 1 && e.value[1] > 0)
+        .map((e) => '${e.key} ${e.value[1]}')
+        .join(' • ');
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: c.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: c.withValues(alpha: 0.25)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.satellite_alt, size: 18, color: c),
+              const SizedBox(width: 6),
+              Text(
+                'GPS الهاتف • أقمار مستخدمة $_satUsed من $_satVisible',
+                style: TextStyle(
+                  color: c,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 13,
+                ),
+              ),
+              const Spacer(),
+              if (_avgCn0 > 0)
+                Text(
+                  '${_avgCn0.toStringAsFixed(0)} dB-Hz',
+                  style: const TextStyle(fontSize: 11.5, color: Colors.black54),
+                ),
+            ],
+          ),
+          if (names.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 3),
+              child: Directionality(
+                textDirection: TextDirection.ltr,
+                child: Text(
+                  names,
+                  style: const TextStyle(fontSize: 11.5, color: Colors.black54),
+                ),
+              ),
+            ),
+          if (_samples.length > 1)
+            Padding(
+              padding: const EdgeInsets.only(top: 3),
+              child: Text(
+                'متوسط ${_samples.length} قراءة (ثبّت الجوال لدقة أعلى)'
+                '${_raw != null ? ' • آخر قراءة ±${_raw!.accuracy.toStringAsFixed(1)}م' : ''}',
+                style: const TextStyle(fontSize: 11.5, color: Colors.black54),
+              ),
+            ),
+          if (_satUsed == 0)
+            const Padding(
+              padding: EdgeInsets.only(top: 3),
+              child: Text(
+                'يبحث عن الأقمار... اطلع لمكان مفتوح بعيداً عن السقف',
+                style: TextStyle(fontSize: 11.5),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
 
   Widget _smallBtn(IconData icon, String label, VoidCallback onTap) =>
       OutlinedButton(

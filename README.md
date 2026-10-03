@@ -12,12 +12,12 @@ https://github.com/alabasi2025/GPS/releases/latest/download/mawqi-now.apk
 
 | البند | القيمة |
 |---|---|
-| الإصدار | 1.0.0 (build 1) |
+| الإصدار | 1.1.0 (build 2) |
 | الحجم | 7.4 MB |
 | المعمارية | arm64-v8a فقط (أندرويد 64-بت) |
 | Target SDK | 36 |
 | اسم الحزمة | `com.mawqianow.location` |
-| SHA-1 | `57e968e06cbae0ff18f3dfee1f154c500b534f52` |
+| SHA-1 | `bb2c411fa9fa7a46453cca9e5553cee9cc091c6e` |
 
 > إذا كانت لديك نسخة سابقة موقّعة بمفتاح مختلف، احذفها قبل التثبيت. فعّل "السماح بالتثبيت من مصادر غير معروفة" عند الطلب.
 
@@ -46,12 +46,24 @@ https://github.com/alabasi2025/GPS/releases/latest/download/mawqi-now.apk
 
 الواجهة: Material 3، اتجاه RTL، الكود كاملاً في `lib/main.dart`.
 
-## ⚙️ آلية الدقة
+## ⚙️ آلية الدقة (v1.1.0 — GPS الهاتف الخام)
 
-1. `getLastKnownPosition()` يُعرض فوراً عند الفتح (أندرويد).
-2. `getPositionStream` بإعدادات `AndroidSettings(accuracy: bestForNavigation, distanceFilter: 0, intervalDuration: 1s)` عبر Fused Location Provider.
-3. فلترة: تُتجاهل القراءة الأسوأ دقةً إذا لم يتحرك المستخدم فعلياً (المسافة أقل من هامش الخطأ وهامش الخطأ > 25م).
-4. يُعاد جلب العنوان فقط عند التحرك أكثر من 40 متراً (لتقليل الطلبات).
+**أندرويد:** القراءة مباشرة من شريحة GNSS عبر كود Kotlin أصلي في `MainActivity.kt`:
+1. `LocationManager.GPS_PROVIDER` فقط — **بدون** Wi-Fi/أبراج/Fused (لا خلط بمصادر تقريبية).
+2. `requestLocationUpdates(GPS_PROVIDER, 0ms, 0m)` → كل قراءة تنتجها الشريحة (~1Hz).
+3. `GnssStatus.Callback` → عدد الأقمار المرئية/المستخدمة، قوة الإشارة (C/N0 dB-Hz)، والأنظمة: GPS, GLONASS, Galileo, BeiDou, QZSS, SBAS.
+4. يُرسل لـ Dart عبر `EventChannel('mawqi/gps')`، و `MethodChannel('mawqi/gps_info')` لفحص توفر/تفعيل GPS.
+5. كشف المواقع الوهمية (`Location.isMock`) وعرض تحذير.
+
+**تحسين الدقة في Dart (`lib/main.dart`):**
+- **متوسط مرجّح بعكس التباين** (وزن = 1/accuracy²) لآخر حتى 60 قراءة أثناء الثبات → نقطة أدق من أي قراءة منفردة.
+- تُقبل في المتوسط القراءات ذات دقة ≤ 50م فقط.
+- يُصفَّر المتوسط عند الحركة (سرعة > 1 م/ث) أو قفزة أكبر من `clamp(1.5×accuracy, 8م, 60م)`.
+- يُعاد جلب العنوان فقط عند التحرك أكثر من 40م.
+
+**الويب:** يستخدم `geolocator` (Geolocation API للمتصفح).
+
+> نصيحة: للحصول على أعلى دقة (2–5م) كن في مكان مفتوح، ثبّت الجوال 20–30 ثانية حتى يتجمع المتوسط.
 
 نص المشاركة:
 ```
@@ -65,6 +77,7 @@ https://maps.google.com/?q=lat,lng
 ## 🤖 إعدادات أندرويد
 
 - الصلاحيات: `INTERNET`, `ACCESS_FINE_LOCATION`, `ACCESS_COARSE_LOCATION`.
+- `<uses-feature android.hardware.location.gps required=false>`.
 - `<queries>` لمخططي `https` و `geo` (مطلوبة لـ url_launcher على Android 11+).
 - `namespace` و `applicationId` و `MainActivity.kt` كلها على `com.mawqianow.location`.
 - توقيع release يُقرأ من `android/key.properties` و `android/release-key.jks` (**غير مرفوعين للمستودع** — أنشئ ملفاتك الخاصة).
@@ -117,13 +130,18 @@ python3 -m http.server 5060 --directory build/web
 ## 📁 البنية
 
 ```
-lib/main.dart                       # التطبيق كاملاً
+lib/main.dart                       # الواجهة + المتوسط المرجّح + المشاركة
 android/app/build.gradle.kts        # التوقيع + R8 + packaging
 android/app/proguard-rules.pro      # قواعد R8
 android/app/src/main/AndroidManifest.xml
-android/app/src/main/kotlin/com/mawqianow/location/MainActivity.kt
+android/app/src/main/kotlin/com/mawqianow/location/MainActivity.kt  # GPS خام + GnssStatus
 ```
 
 ## ⚖️ ملاحظات الاستخدام
 
 - بيانات الخريطة والعنوان من © OpenStreetMap contributors. Nominatim له سياسة استخدام عادل (طلب واحد/ثانية تقريباً) — التطبيق يلتزم بها عبر جلب العنوان فقط عند التحرك 40م+.
+
+## 📜 سجل الإصدارات
+
+- **v1.1.0** — قراءة GPS الهاتف مباشرة (GPS_PROVIDER)، عرض الأقمار والأنظمة وقوة الإشارة، متوسط مرجّح للقراءات، كشف المواقع الوهمية.
+- **v1.0.0** — الإصدار الأول (Fused Location عبر geolocator).
