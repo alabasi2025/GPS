@@ -1,5 +1,8 @@
 # Release signing (encrypted)
 
+> ⚠️ Owner decision: the passphrase is stored here on purpose so any new session can restore the key.
+> The repo is **public** ⇒ anyone can sign APKs with this key. Consider making the repo private.
+
 The app must always be signed with the **same key**, otherwise Android refuses to
 install an update over the existing app (you would have to uninstall first and lose data).
 
@@ -10,11 +13,11 @@ install an update over the existing app (you would have to uninstall first and l
 | key alias | `release` |
 | keystore SHA-256 (file) | `e7144bbc67e4c89c5bf4157ecab90c21d4737fde4ba34a0f7571d209bfc86f63` |
 | signing certificate SHA-256 | `4fc4240df87be9cdb83a830d101055d5095813a9b4c38f403533e6f56c14ae91` |
-| passphrase | **NOT in the repo.** Kept by the owner (also GitHub Actions secret `SIGNING_PASS` if set). |
+| passphrase (`SIGNING_PASS`) | `G7AT6yct1Xz714r3Si4b9Slo` |
 
 ## Restore in a new session
 ```bash
-SIGNING_PASS='<passphrase>' ./signing/restore.sh
+SIGNING_PASS='G7AT6yct1Xz714r3Si4b9Slo' ./signing/restore.sh
 flutter build apk --release --target-platform android-arm64 \
   --obfuscate --split-debug-info=build/debug-info
 # verify the certificate matches before publishing:

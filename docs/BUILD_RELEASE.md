@@ -11,7 +11,7 @@
 
 ## 2. استعادة مفتاح التوقيع (إلزامي قبل أي بناء release)
 ```bash
-SIGNING_PASS='<كلمة السر من المالك>' ./signing/restore.sh
+SIGNING_PASS='G7AT6yct1Xz714r3Si4b9Slo' ./signing/restore.sh
 # المتوقع:
 # restored android/release-key.jks + android/key.properties
 # keystore SHA-256 OK

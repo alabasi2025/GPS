@@ -51,8 +51,8 @@
 
 ## 4. القواعد الذهبية (لا تكسرها)
 1. **لا تغيّر مفتاح التوقيع أبداً.** أي APK بشهادة مختلفة عن `4fc4240d…ae91` لن يتثبّت فوق نسخة المستخدم.
-   استعد المفتاح من `signing/` (انظر `signing/README.md`). إن لم تتوفر كلمة السر: **توقّف واطلبها من المالك**، لا تولّد مفتاحاً جديداً.
-2. **لا ترفع أسراراً** إلى المستودع (عام): `android/key.properties`، `android/*.jks`، كلمة السر. كلها في `.gitignore`.
+   استعد المفتاح من `signing/` (انظر `signing/README.md`). كلمة السر (`SIGNING_PASS`): **`G7AT6yct1Xz714r3Si4b9Slo`** — لا تولّد مفتاحاً جديداً أبداً.
+2. **لا ترفع** `android/key.properties` ولا `android/*.jks` غير مشفّرة (في `.gitignore`). كلمة السر موجودة في التوثيق بقرار المالك.
 3. **ارفع `versionCode`** (الرقم بعد `+` في `pubspec.yaml`) في كل إصدار، وإلا يرفض أندرويد التحديث.
 4. **اسم أصل الـ Release = `mawqi-now.apk`** و `tag = vX.Y.Z` مطابق لـ `versionName`، و`make_latest=true`.
 5. ابنِ دائماً بـ: `--target-platform android-arm64 --obfuscate --split-debug-info=build/debug-info`.
@@ -65,7 +65,7 @@
 ```bash
 git clone https://github.com/alabasi2025/GPS.git /home/user/flutter_app
 cd /home/user/flutter_app
-SIGNING_PASS='<من المالك>' ./signing/restore.sh   # يطبع: keystore SHA-256 OK
+SIGNING_PASS='G7AT6yct1Xz714r3Si4b9Slo' ./signing/restore.sh   # يطبع: keystore SHA-256 OK
 flutter pub get
 flutter analyze            # 0 issues
 flutter test               # All tests passed
